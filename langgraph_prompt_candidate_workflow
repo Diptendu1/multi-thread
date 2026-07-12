@@ -1,0 +1,331 @@
+"""
+LangGraph implementation of the "Prompt Candidate Approval" workflow.
+
+Maps to the sequence diagram:
+
+  Agent 5 (Prompt Architect)  --> proposes a prompt_candidate (status=Pending_Approval)
+  Orchestrator                --> Agent 4 (Reviewer): validate candidate (faithfulness)
+  Orchestrator                --> Postgres: audit_trail for candidate
+  Orchestrator                --> UI (Prompt Diff Viewer): show old/new prompt + rationale
+  UI                          --> Coach: old prompt | new prompt | rationale
+  alt Coach clicks Accept:
+      Coach -> UI -> Orchestrator: Decision Approve
+      Postgres: previous approved -> Superseded
+      Postgres: new candidate -> Approved
+      Orchestrator: increment attempts counter
+      Orchestrator -> Agent 5: re-trigger with new approved prompt
+      Agent 5 -> Agent 4: validate output
+  [Coach clicks Reject]:
+      Coach -> UI -> Orchestrator: Decision Reject (optional rationale)
+      Postgres: candidate -> Rejected
+      Orchestrator: increment attempts counter
+      (Coach may submit a fresh direction -> loops back to Agent 5)
+
+  Circuit breaker: max attempts per agent per project = 10
+  (Approved + Rejected count together toward the limit)
+"""
+
+from __future__ import annotations
+
+import operator
+import uuid
+from typing import Annotated, Literal, Optional, TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+
+MAX_ATTEMPTS_PER_AGENT_PER_PROJECT = 10
+
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+class PromptCandidate(TypedDict):
+    id: str
+    proposed_prompt_text: str
+    rationale: str
+    status: str  # Pending_Approval | Approved | Rejected | Superseded
+
+
+class WorkflowState(TypedDict):
+    project_id: str
+    agent_id: str
+
+    current_prompt_text: str          # the currently approved / "old" prompt
+    candidate: Optional[PromptCandidate]
+
+    faithfulness_ok: Optional[bool]
+    coach_decision: Optional[Literal["accept", "reject"]]
+    coach_rationale: Optional[str]
+    fresh_direction: Optional[str]     # coach can submit fresh direction on reject
+
+    attempts: int                      # approved + rejected count, per agent/project
+    audit_log: Annotated[list[str], operator.add]
+    output_validated: Optional[bool]
+
+    circuit_breaker_tripped: bool
+
+
+# --------------------------------------------------------------------------
+# Simulated external systems (swap these for real DB / model calls)
+# --------------------------------------------------------------------------
+
+def _postgres_write(event: str) -> str:
+    """Stand-in for the Postgres audit_trail sink in the diagram."""
+    return f"[postgres] {event}"
+
+
+def _call_agent5_prompt_architect(project_id: str, fresh_direction: Optional[str]) -> PromptCandidate:
+    """Stand-in for Agent 5 (Prompt Architect) proposing/revising a prompt."""
+    direction_note = f" incorporating fresh direction: {fresh_direction}" if fresh_direction else ""
+    return {
+        "id": str(uuid.uuid4()),
+        "proposed_prompt_text": f"<revised prompt for {project_id}{direction_note}>",
+        "rationale": "Improves clarity and reduces ambiguity in edge cases.",
+        "status": "Pending_Approval",
+    }
+
+
+def _call_agent4_reviewer_faithfulness(candidate: PromptCandidate) -> bool:
+    """Stand-in for Agent 4 (Reviewer) validating candidate faithfulness."""
+    return True
+
+
+def _call_agent4_reviewer_output(new_prompt_text: str) -> bool:
+    """Stand-in for Agent 4 (Reviewer) validating output after re-trigger."""
+    return True
+
+
+# --------------------------------------------------------------------------
+# Nodes
+# --------------------------------------------------------------------------
+
+def propose_candidate(state: WorkflowState) -> dict:
+    """Agent 5 proposes a new prompt candidate (status=Pending_Approval)."""
+    candidate = _call_agent5_prompt_architect(
+        state["project_id"], state.get("fresh_direction")
+    )
+    return {
+        "candidate": candidate,
+        "fresh_direction": None,
+        "audit_log": [_postgres_write(
+            f"candidate {candidate['id']} created, status=Pending_Approval"
+        )],
+    }
+
+
+def validate_candidate(state: WorkflowState) -> dict:
+    """Orchestrator -> Agent 4: Validate candidate (faithfulness)."""
+    ok = _call_agent4_reviewer_faithfulness(state["candidate"])
+    return {"faithfulness_ok": ok}
+
+
+def audit_trail_candidate(state: WorkflowState) -> dict:
+    """Orchestrator -> Postgres: audit_trail for candidate."""
+    return {
+        "audit_log": [_postgres_write(
+            f"audit_trail: candidate {state['candidate']['id']} "
+            f"faithfulness_ok={state['faithfulness_ok']}"
+        )]
+    }
+
+
+def show_diff_and_get_decision(state: WorkflowState) -> dict:
+    """
+    UI (Prompt Diff Viewer) shows old/new prompt + rationale to the Coach,
+    then pauses the graph until the Coach responds (Accept / Reject).
+
+    This uses LangGraph's interrupt() for a human-in-the-loop pause.
+    Resume with:
+        Command(resume={"decision": "accept"})
+    or
+        Command(resume={"decision": "reject", "rationale": "...", "fresh_direction": "..."})
+    """
+    diff_payload = {
+        "old_prompt": state["current_prompt_text"],
+        "new_prompt": state["candidate"]["proposed_prompt_text"],
+        "rationale": state["candidate"]["rationale"],
+    }
+    coach_response = interrupt(diff_payload)  # pauses here for Coach input
+
+    return {
+        "coach_decision": coach_response["decision"],
+        "coach_rationale": coach_response.get("rationale"),
+        "fresh_direction": coach_response.get("fresh_direction"),
+    }
+
+
+def route_on_decision(state: WorkflowState) -> Literal["accept_branch", "reject_branch"]:
+    return "accept_branch" if state["coach_decision"] == "accept" else "reject_branch"
+
+
+def accept_branch(state: WorkflowState) -> dict:
+    """
+    Coach clicks Accept:
+      - previous approved -> Superseded
+      - new candidate -> Approved
+      - increment attempts counter
+    """
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Approved"
+    return {
+        "candidate": candidate,
+        "current_prompt_text": candidate["proposed_prompt_text"],
+        "attempts": state["attempts"] + 1,
+        "audit_log": [
+            _postgres_write("previous approved prompt -> Superseded"),
+            _postgres_write(f"candidate {candidate['id']} -> Approved"),
+        ],
+    }
+
+
+def reject_branch(state: WorkflowState) -> dict:
+    """
+    Coach clicks Reject (optional rationale):
+      - candidate -> Rejected
+      - increment attempts counter
+      - Coach may submit fresh direction for next attempt
+    """
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Rejected"
+    return {
+        "candidate": candidate,
+        "attempts": state["attempts"] + 1,
+        "audit_log": [_postgres_write(
+            f"candidate {candidate['id']} -> Rejected "
+            f"(rationale: {state.get('coach_rationale') or 'none'})"
+        )],
+    }
+
+
+def check_circuit_breaker(state: WorkflowState) -> dict:
+    """Circuit breaker: max attempts per agent per project = 10 (Approved+Rejected)."""
+    tripped = state["attempts"] >= MAX_ATTEMPTS_PER_AGENT_PER_PROJECT
+    log = []
+    if tripped:
+        log.append(_postgres_write(
+            f"circuit breaker tripped for agent={state['agent_id']} "
+            f"project={state['project_id']} after {state['attempts']} attempts"
+        ))
+    return {"circuit_breaker_tripped": tripped, "audit_log": log}
+
+
+def retrigger_and_validate_output(state: WorkflowState) -> dict:
+    """
+    Orchestrator -> Agent 5: re-trigger with new approved prompt.
+    Agent 5 -> Agent 4: validate output.
+    """
+    ok = _call_agent4_reviewer_output(state["current_prompt_text"])
+    return {
+        "output_validated": ok,
+        "audit_log": [_postgres_write(
+            f"re-triggered with approved prompt; output_validated={ok}"
+        )],
+    }
+
+
+def route_after_circuit_breaker(
+    state: WorkflowState,
+) -> Literal["approved_path", "rejected_retry", "breaker_tripped"]:
+    if state["circuit_breaker_tripped"]:
+        return "breaker_tripped"
+    if state["coach_decision"] == "accept":
+        return "approved_path"
+    return "rejected_retry"  # loop back for a fresh attempt (Coach may give fresh direction)
+
+
+def stop_circuit_breaker_tripped(state: WorkflowState) -> dict:
+    return {
+        "audit_log": [_postgres_write("workflow halted: circuit breaker limit reached")]
+    }
+
+
+# --------------------------------------------------------------------------
+# Graph assembly
+# --------------------------------------------------------------------------
+
+def build_graph():
+    graph = StateGraph(WorkflowState)
+
+    graph.add_node("propose_candidate", propose_candidate)
+    graph.add_node("validate_candidate", validate_candidate)
+    graph.add_node("audit_trail_candidate", audit_trail_candidate)
+    graph.add_node("show_diff_and_get_decision", show_diff_and_get_decision)
+    graph.add_node("accept_branch", accept_branch)
+    graph.add_node("reject_branch", reject_branch)
+    graph.add_node("check_circuit_breaker", check_circuit_breaker)
+    graph.add_node("retrigger_and_validate_output", retrigger_and_validate_output)
+    graph.add_node("stop_circuit_breaker_tripped", stop_circuit_breaker_tripped)
+
+    graph.add_edge(START, "propose_candidate")
+    graph.add_edge("propose_candidate", "validate_candidate")
+    graph.add_edge("validate_candidate", "audit_trail_candidate")
+    graph.add_edge("audit_trail_candidate", "show_diff_and_get_decision")
+
+    graph.add_conditional_edges(
+        "show_diff_and_get_decision",
+        route_on_decision,
+        {"accept_branch": "accept_branch", "reject_branch": "reject_branch"},
+    )
+
+    graph.add_edge("accept_branch", "check_circuit_breaker")
+    graph.add_edge("reject_branch", "check_circuit_breaker")
+
+    graph.add_conditional_edges(
+        "check_circuit_breaker",
+        route_after_circuit_breaker,
+        {
+            "approved_path": "retrigger_and_validate_output",
+            "rejected_retry": "propose_candidate",  # loop: Agent 5 tries again
+            "breaker_tripped": "stop_circuit_breaker_tripped",
+        },
+    )
+
+    graph.add_edge("retrigger_and_validate_output", END)
+    graph.add_edge("stop_circuit_breaker_tripped", END)
+
+    return graph.compile(checkpointer=MemorySaver())
+
+
+# --------------------------------------------------------------------------
+# Example run
+# --------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app = build_graph()
+    config = {"configurable": {"thread_id": "project-42-agent-5"}}
+
+    initial_state: WorkflowState = {
+        "project_id": "project-42",
+        "agent_id": "agent-5-prompt-architect",
+        "current_prompt_text": "<current approved prompt>",
+        "candidate": None,
+        "faithfulness_ok": None,
+        "coach_decision": None,
+        "coach_rationale": None,
+        "fresh_direction": None,
+        "attempts": 0,
+        "audit_log": [],
+        "output_validated": None,
+        "circuit_breaker_tripped": False,
+    }
+
+    # Run until the graph pauses for the Coach's decision (interrupt).
+    result = app.invoke(initial_state, config=config)
+    print("Paused for Coach decision. Diff shown:", result.get("__interrupt__"))
+
+    # Simulate the Coach clicking "Accept" in the UI and resuming the graph.
+    final_result = app.invoke(
+        Command(resume={"decision": "accept"}),
+        config=config,
+    )
+
+    print("\n--- Final state ---")
+    for key in ("candidate", "current_prompt_text", "attempts", "output_validated"):
+        print(f"{key}: {final_result.get(key)}")
+
+    print("\n--- Audit log ---")
+    for entry in final_result["audit_log"]:
+        print(entry)
