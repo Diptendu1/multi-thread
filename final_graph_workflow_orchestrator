@@ -1,0 +1,532 @@
+"""
+LangGraph implementation of the FULL "Coaching Direction -> Prompt Candidate ->
+Approval" orchestration shown across both sequence diagrams.
+
+Actors / lifelines:
+    Coach, UI (Prompt Diff Viewer), Orchestrator, Agent 5 (Prompt Architect),
+    Agent 4 (Reviewer), PostgreSQL, Architect Escalation Inbox
+
+Flow (numbered to match the diagram):
+
+  1. Coach -> UI: Submit coaching direction
+  2. UI -> Orchestrator: coaching_feedback row (Pending)
+  3. Orchestrator -> Postgres: Write coaching_feedback
+  4. Orchestrator -> Agent 5: Rewrite prompt for target_agent
+  5. Agent 5 -> Postgres: Read current approved prompt (base_prompt_version)
+  6. Agent 5 (self): Pattern check + semantic check on direction
+
+  alt [Injection flagged]
+      7. Agent 5 -> Postgres: prompt_candidates status=Flagged_Injection
+      8. Orchestrator -> Architect Escalation Inbox
+         (Coach sees "Under review")
+      9. Architect Escalation Inbox -> Orchestrator: Dismiss or Confirm
+  [Clean]
+      10. Agent 5 -> Postgres: prompt_candidates status=Pending_Approval
+          (proposed_prompt_text + rationale)
+      11. Orchestrator -> Agent 4: Validate candidate (faithfulness)
+      12. Agent 4 -> Postgres: audit_trail for candidate
+      13. Orchestrator -> UI: Show Prompt Diff Viewer
+      14. UI -> Coach: Old prompt | New prompt | Rationale
+
+      alt [Coach clicks Accept]
+          15. Coach -> UI: Accept
+          16. UI -> Orchestrator: Decision Approve
+          17. Orchestrator -> Postgres: Previous Approved -> Superseded
+          18. Orchestrator -> Postgres: New candidate -> Approved
+          19. Orchestrator (self): Increment attempts counter
+          20. Orchestrator -> Agent 5: Re-trigger with new approved prompt
+          22. Agent 5 -> Agent 4: Validate output
+      [Coach clicks Reject]
+          23. Coach -> UI: Reject (optional rationale)
+          24. UI -> Orchestrator: Decision Reject
+          25. Orchestrator -> Postgres: Candidate -> Rejected
+          26. Orchestrator (self): Increment attempts counter
+          (Coach may submit fresh direction -> loops back to step 1/4)
+
+  Circuit breaker: max attempts per agent per project = 10
+  (Approved + Rejected count together toward the limit)
+
+Human-in-the-loop pauses (LangGraph `interrupt()`):
+    - receive_coaching_direction  -> Coach types a direction
+    - escalate_to_architect       -> Architect Escalation Inbox: Dismiss/Confirm
+    - show_diff_and_get_decision  -> Coach: Accept/Reject on the diff viewer
+    - offer_fresh_direction       -> Coach: optionally supply a fresh direction
+                                      after a rejection
+"""
+
+from __future__ import annotations
+
+import operator
+import uuid
+from typing import Annotated, Literal, Optional, TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt, Command
+
+MAX_ATTEMPTS_PER_AGENT_PER_PROJECT = 10
+
+
+# --------------------------------------------------------------------------
+# State
+# --------------------------------------------------------------------------
+
+class PromptCandidate(TypedDict):
+    id: str
+    proposed_prompt_text: str
+    rationale: str
+    status: str  # Flagged_Injection | Pending_Approval | Approved | Rejected | Superseded
+
+
+class WorkflowState(TypedDict):
+    project_id: str
+    target_agent: str
+
+    coaching_feedback_id: Optional[str]
+    coaching_direction: Optional[str]
+
+    base_prompt_version: Optional[str]
+    current_prompt_text: str  # the currently approved / "old" prompt
+
+    injection_flagged: Optional[bool]
+    candidate: Optional[PromptCandidate]
+    escalation_decision: Optional[Literal["dismiss", "confirm"]]
+    coach_visible_status: Optional[str]  # e.g. "Under review"
+
+    faithfulness_ok: Optional[bool]
+    coach_decision: Optional[Literal["accept", "reject"]]
+    coach_rationale: Optional[str]
+    fresh_direction: Optional[str]
+
+    attempts: int  # approved + rejected count, per agent/project
+    circuit_breaker_tripped: bool
+    output_validated: Optional[bool]
+
+    audit_log: Annotated[list[str], operator.add]
+
+
+# --------------------------------------------------------------------------
+# Simulated external systems (swap these for real DB / model calls)
+# --------------------------------------------------------------------------
+
+def _postgres_write(event: str) -> str:
+    return f"[postgres] {event}"
+
+
+def _read_base_prompt_version(target_agent: str) -> str:
+    """Agent 5 -> Postgres: read current approved prompt for target_agent."""
+    return f"<current approved prompt for {target_agent}>"
+
+
+def _agent5_pattern_and_semantic_check(direction: str) -> bool:
+    """
+    Agent 5's self-check on the coaching direction.
+    Returns True if a prompt-injection attempt is flagged.
+    """
+    suspicious_markers = ("ignore previous", "disregard system", "reveal system prompt")
+    return any(marker in direction.lower() for marker in suspicious_markers)
+
+
+def _agent5_generate_candidate(target_agent: str, base_prompt: str, direction: str) -> PromptCandidate:
+    """Agent 5 (Prompt Architect) drafts a revised prompt from the direction."""
+    return {
+        "id": str(uuid.uuid4()),
+        "proposed_prompt_text": f"<revision of '{base_prompt}' for {target_agent} per: {direction}>",
+        "rationale": "Incorporates coaching direction while preserving original intent.",
+        "status": "Pending_Approval",
+    }
+
+
+def _agent4_validate_faithfulness(candidate: PromptCandidate) -> bool:
+    return True
+
+
+def _agent4_validate_output(new_prompt_text: str) -> bool:
+    return True
+
+
+# --------------------------------------------------------------------------
+# Nodes
+# --------------------------------------------------------------------------
+
+def receive_coaching_direction(state: WorkflowState) -> dict:
+    """Steps 1-2: Coach submits a direction; Orchestrator opens a Pending row."""
+    if state.get("coaching_direction"):
+        direction = state["coaching_direction"]
+    else:
+        response = interrupt({
+            "ui": "Submit coaching direction",
+            "target_agent": state["target_agent"],
+        })
+        direction = response["coaching_direction"]
+
+    return {
+        "coaching_direction": direction,
+        "coaching_feedback_id": str(uuid.uuid4()),
+        "coach_visible_status": "Pending",
+        "audit_log": [_postgres_write(
+            f"coaching_feedback row created (Pending) for {state['target_agent']}"
+        )],
+    }
+
+
+def write_coaching_feedback(state: WorkflowState) -> dict:
+    """Step 3: Orchestrator -> Postgres: Write coaching_feedback."""
+    return {
+        "audit_log": [_postgres_write(
+            f"coaching_feedback {state['coaching_feedback_id']} written: "
+            f"{state['coaching_direction']!r}"
+        )]
+    }
+
+
+def agent5_read_base_prompt(state: WorkflowState) -> dict:
+    """Steps 4-5: Orchestrator triggers Agent 5; Agent 5 reads base_prompt_version."""
+    base_prompt = _read_base_prompt_version(state["target_agent"])
+    return {
+        "base_prompt_version": base_prompt,
+        "current_prompt_text": state.get("current_prompt_text") or base_prompt,
+        "audit_log": [_postgres_write(
+            f"agent5 read base_prompt_version for {state['target_agent']}"
+        )],
+    }
+
+
+def agent5_check_and_draft(state: WorkflowState) -> dict:
+    """Step 6: Agent 5 self-loop - pattern check + semantic check, then drafts."""
+    flagged = _agent5_pattern_and_semantic_check(state["coaching_direction"])
+    candidate = _agent5_generate_candidate(
+        state["target_agent"], state["current_prompt_text"], state["coaching_direction"]
+    )
+    if flagged:
+        candidate["status"] = "Flagged_Injection"
+    return {
+        "injection_flagged": flagged,
+        "candidate": candidate,
+        "audit_log": [_postgres_write(
+            f"agent5 pattern+semantic check complete, injection_flagged={flagged}"
+        )],
+    }
+
+
+def route_injection_check(state: WorkflowState) -> Literal["flagged", "clean"]:
+    return "flagged" if state["injection_flagged"] else "clean"
+
+
+def flag_candidate_injection(state: WorkflowState) -> dict:
+    """Step 7: Agent 5 -> Postgres: prompt_candidates status=Flagged_Injection."""
+    return {
+        "audit_log": [_postgres_write(
+            f"candidate {state['candidate']['id']} -> Flagged_Injection"
+        )]
+    }
+
+
+def escalate_to_architect(state: WorkflowState) -> dict:
+    """
+    Steps 8-9: Orchestrator -> Architect Escalation Inbox; Coach sees "Under review";
+    pauses until the architect Dismisses (false positive) or Confirms (real injection).
+    """
+    response = interrupt({
+        "ui": "Architect Escalation Inbox",
+        "candidate_id": state["candidate"]["id"],
+        "coaching_direction": state["coaching_direction"],
+        "proposed_prompt_text": state["candidate"]["proposed_prompt_text"],
+        "action_required": "Dismiss or Confirm",
+    })
+    return {
+        "escalation_decision": response["decision"],  # "dismiss" | "confirm"
+        "coach_visible_status": "Under review",
+        "audit_log": [_postgres_write(
+            f"architect escalation resolved: {response['decision']}"
+        )],
+    }
+
+
+def route_escalation_decision(state: WorkflowState) -> Literal["dismiss", "confirm"]:
+    return state["escalation_decision"]
+
+
+def clear_flag_after_dismiss(state: WorkflowState) -> dict:
+    """Architect dismissed the flag as a false positive -> proceed as Clean."""
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Pending_Approval"
+    return {
+        "candidate": candidate,
+        "injection_flagged": False,
+        "audit_log": [_postgres_write(
+            f"candidate {candidate['id']} flag dismissed by architect, resuming clean path"
+        )],
+    }
+
+
+def halt_on_confirmed_injection(state: WorkflowState) -> dict:
+    """Architect confirmed a real injection attempt -> stop, require fresh direction."""
+    return {
+        "coach_visible_status": "Rejected - injection confirmed",
+        "coaching_direction": None,  # force a fresh submission if retried
+        "audit_log": [_postgres_write(
+            f"candidate {state['candidate']['id']} injection CONFIRMED - workflow halted"
+        )],
+    }
+
+
+def propose_candidate_pending(state: WorkflowState) -> dict:
+    """Step 10 [Clean]: Agent 5 -> Postgres: prompt_candidates status=Pending_Approval."""
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Pending_Approval"
+    return {
+        "candidate": candidate,
+        "coach_visible_status": "Pending_Approval",
+        "audit_log": [_postgres_write(
+            f"candidate {candidate['id']} -> Pending_Approval "
+            f"({candidate['proposed_prompt_text']})"
+        )],
+    }
+
+
+def validate_candidate(state: WorkflowState) -> dict:
+    """Step 11: Orchestrator -> Agent 4: Validate candidate (faithfulness)."""
+    ok = _agent4_validate_faithfulness(state["candidate"])
+    return {"faithfulness_ok": ok}
+
+
+def audit_trail_candidate(state: WorkflowState) -> dict:
+    """Step 12: Agent 4 -> Postgres: audit_trail for candidate."""
+    return {
+        "audit_log": [_postgres_write(
+            f"audit_trail: candidate {state['candidate']['id']} "
+            f"faithfulness_ok={state['faithfulness_ok']}"
+        )]
+    }
+
+
+def show_diff_and_get_decision(state: WorkflowState) -> dict:
+    """
+    Steps 13-16: Orchestrator -> UI: Show Prompt Diff Viewer; UI -> Coach: old/new/
+    rationale; pauses until the Coach clicks Accept or Reject.
+    """
+    response = interrupt({
+        "ui": "Prompt Diff Viewer",
+        "old_prompt": state["current_prompt_text"],
+        "new_prompt": state["candidate"]["proposed_prompt_text"],
+        "rationale": state["candidate"]["rationale"],
+    })
+    return {
+        "coach_decision": response["decision"],  # "accept" | "reject"
+        "coach_rationale": response.get("rationale"),
+    }
+
+
+def route_on_decision(state: WorkflowState) -> Literal["accept_branch", "reject_branch"]:
+    return "accept_branch" if state["coach_decision"] == "accept" else "reject_branch"
+
+
+def accept_branch(state: WorkflowState) -> dict:
+    """Steps 17-19: supersede previous approved, mark new Approved, increment attempts."""
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Approved"
+    return {
+        "candidate": candidate,
+        "current_prompt_text": candidate["proposed_prompt_text"],
+        "attempts": state["attempts"] + 1,
+        "audit_log": [
+            _postgres_write("previous approved prompt -> Superseded"),
+            _postgres_write(f"candidate {candidate['id']} -> Approved"),
+        ],
+    }
+
+
+def reject_branch(state: WorkflowState) -> dict:
+    """Steps 23-26: candidate -> Rejected, increment attempts."""
+    candidate = dict(state["candidate"])
+    candidate["status"] = "Rejected"
+    return {
+        "candidate": candidate,
+        "attempts": state["attempts"] + 1,
+        "audit_log": [_postgres_write(
+            f"candidate {candidate['id']} -> Rejected "
+            f"(rationale: {state.get('coach_rationale') or 'none'})"
+        )],
+    }
+
+
+def check_circuit_breaker(state: WorkflowState) -> dict:
+    """Circuit breaker: max attempts per agent per project = 10 (Approved+Rejected)."""
+    tripped = state["attempts"] >= MAX_ATTEMPTS_PER_AGENT_PER_PROJECT
+    log = []
+    if tripped:
+        log.append(_postgres_write(
+            f"circuit breaker tripped for agent={state['target_agent']} "
+            f"project={state['project_id']} after {state['attempts']} attempts"
+        ))
+    return {"circuit_breaker_tripped": tripped, "audit_log": log}
+
+
+def route_after_circuit_breaker(
+    state: WorkflowState,
+) -> Literal["approved_path", "rejected_retry", "breaker_tripped"]:
+    if state["circuit_breaker_tripped"]:
+        return "breaker_tripped"
+    return "approved_path" if state["coach_decision"] == "accept" else "rejected_retry"
+
+
+def retrigger_and_validate_output(state: WorkflowState) -> dict:
+    """Steps 20, 22: re-trigger Agent 5 with the newly approved prompt; Agent 4 validates output."""
+    ok = _agent4_validate_output(state["current_prompt_text"])
+    return {
+        "output_validated": ok,
+        "coach_visible_status": "Approved",
+        "audit_log": [_postgres_write(
+            f"re-triggered with approved prompt; output_validated={ok}"
+        )],
+    }
+
+
+def offer_fresh_direction(state: WorkflowState) -> dict:
+    """
+    'Coach may submit fresh direction' note: after a rejection (and while under
+    the circuit-breaker limit), pause and let the Coach either supply a new
+    direction or retry with the same one before looping back to Agent 5.
+    """
+    response = interrupt({
+        "ui": "Coach may submit fresh direction",
+        "previous_direction": state["coaching_direction"],
+        "previous_rationale": state.get("coach_rationale"),
+    })
+    fresh = response.get("fresh_direction")
+    return {
+        "coaching_direction": fresh if fresh else state["coaching_direction"],
+        "coaching_feedback_id": None,  # a new Pending row will be opened on re-entry
+    }
+
+
+def stop_circuit_breaker_tripped(state: WorkflowState) -> dict:
+    return {
+        "coach_visible_status": "Halted - attempt limit reached",
+        "audit_log": [_postgres_write("workflow halted: circuit breaker limit reached")],
+    }
+
+
+# --------------------------------------------------------------------------
+# Graph assembly
+# --------------------------------------------------------------------------
+
+def build_graph():
+    graph = StateGraph(WorkflowState)
+
+    graph.add_node("receive_coaching_direction", receive_coaching_direction)
+    graph.add_node("write_coaching_feedback", write_coaching_feedback)
+    graph.add_node("agent5_read_base_prompt", agent5_read_base_prompt)
+    graph.add_node("agent5_check_and_draft", agent5_check_and_draft)
+    graph.add_node("flag_candidate_injection", flag_candidate_injection)
+    graph.add_node("escalate_to_architect", escalate_to_architect)
+    graph.add_node("clear_flag_after_dismiss", clear_flag_after_dismiss)
+    graph.add_node("halt_on_confirmed_injection", halt_on_confirmed_injection)
+    graph.add_node("propose_candidate_pending", propose_candidate_pending)
+    graph.add_node("validate_candidate", validate_candidate)
+    graph.add_node("audit_trail_candidate", audit_trail_candidate)
+    graph.add_node("show_diff_and_get_decision", show_diff_and_get_decision)
+    graph.add_node("accept_branch", accept_branch)
+    graph.add_node("reject_branch", reject_branch)
+    graph.add_node("check_circuit_breaker", check_circuit_breaker)
+    graph.add_node("retrigger_and_validate_output", retrigger_and_validate_output)
+    graph.add_node("offer_fresh_direction", offer_fresh_direction)
+    graph.add_node("stop_circuit_breaker_tripped", stop_circuit_breaker_tripped)
+
+    graph.add_edge(START, "receive_coaching_direction")
+    graph.add_edge("receive_coaching_direction", "write_coaching_feedback")
+    graph.add_edge("write_coaching_feedback", "agent5_read_base_prompt")
+    graph.add_edge("agent5_read_base_prompt", "agent5_check_and_draft")
+
+    graph.add_conditional_edges(
+        "agent5_check_and_draft",
+        route_injection_check,
+        {"flagged": "flag_candidate_injection", "clean": "propose_candidate_pending"},
+    )
+
+    graph.add_edge("flag_candidate_injection", "escalate_to_architect")
+    graph.add_conditional_edges(
+        "escalate_to_architect",
+        route_escalation_decision,
+        {"dismiss": "clear_flag_after_dismiss", "confirm": "halt_on_confirmed_injection"},
+    )
+    graph.add_edge("clear_flag_after_dismiss", "propose_candidate_pending")
+    graph.add_edge("halt_on_confirmed_injection", END)
+
+    graph.add_edge("propose_candidate_pending", "validate_candidate")
+    graph.add_edge("validate_candidate", "audit_trail_candidate")
+    graph.add_edge("audit_trail_candidate", "show_diff_and_get_decision")
+
+    graph.add_conditional_edges(
+        "show_diff_and_get_decision",
+        route_on_decision,
+        {"accept_branch": "accept_branch", "reject_branch": "reject_branch"},
+    )
+
+    graph.add_edge("accept_branch", "check_circuit_breaker")
+    graph.add_edge("reject_branch", "check_circuit_breaker")
+
+    graph.add_conditional_edges(
+        "check_circuit_breaker",
+        route_after_circuit_breaker,
+        {
+            "approved_path": "retrigger_and_validate_output",
+            "rejected_retry": "offer_fresh_direction",
+            "breaker_tripped": "stop_circuit_breaker_tripped",
+        },
+    )
+
+    graph.add_edge("retrigger_and_validate_output", END)
+    graph.add_edge("offer_fresh_direction", "agent5_read_base_prompt")  # loop back
+    graph.add_edge("stop_circuit_breaker_tripped", END)
+
+    return graph.compile(checkpointer=MemorySaver())
+
+
+# --------------------------------------------------------------------------
+# Example run
+# --------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    app = build_graph()
+    config = {"configurable": {"thread_id": "project-42-agent-5"}}
+
+    initial_state: WorkflowState = {
+        "project_id": "project-42",
+        "target_agent": "agent-5-prompt-architect",
+        "coaching_feedback_id": None,
+        "coaching_direction": "Be more concise and cite sources when possible.",
+        "base_prompt_version": None,
+        "current_prompt_text": "<current approved prompt>",
+        "injection_flagged": None,
+        "candidate": None,
+        "escalation_decision": None,
+        "coach_visible_status": None,
+        "faithfulness_ok": None,
+        "coach_decision": None,
+        "coach_rationale": None,
+        "fresh_direction": None,
+        "attempts": 0,
+        "circuit_breaker_tripped": False,
+        "output_validated": None,
+        "audit_log": [],
+    }
+
+    # Runs until the graph pauses at the Prompt Diff Viewer (clean path, no injection).
+    result = app.invoke(initial_state, config=config)
+    print("Paused for Coach decision. Diff shown:", result.get("__interrupt__"))
+
+    # Simulate the Coach clicking "Accept".
+    final_result = app.invoke(
+        Command(resume={"decision": "accept"}),
+        config=config,
+    )
+
+    print("\n--- Final state ---")
+    for key in ("candidate", "current_prompt_text", "attempts", "output_validated", "coach_visible_status"):
+        print(f"{key}: {final_result.get(key)}")
+
+    print("\n--- Audit log ---")
+    for entry in final_result["audit_log"]:
+        print(entry)
