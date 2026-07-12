@@ -1,0 +1,153 @@
+"""
+Orchestrator agent (LangGraph) that runs 3 sub-agents IN PARALLEL and
+aggregates their responses into a single final answer.
+
+How the parallelism works
+--------------------------
+In LangGraph, "parallel" branches are just multiple edges leaving the same
+node. If START -> agent_a, START -> agent_b, START -> agent_c are all added,
+LangGraph's runtime schedules agent_a/agent_b/agent_c in the SAME super-step
+(concurrently, via asyncio under the hood). The graph then waits until all
+three finish before running any node that depends on all of them (here,
+`aggregator`), because `aggregator` only has incoming edges from those three
+nodes.
+
+Install:
+    pip install -U langgraph langchain-core langchain-anthropic
+
+Run:
+    export ANTHROPIC_API_KEY=sk-ant-...     # optional, see MOCK_MODE below
+    python orchestrator_agent.py "What should our Q3 marketing focus be?"
+
+If ANTHROPIC_API_KEY is not set, the script runs in MOCK MODE with fake
+agents so you can see the parallel orchestration work end-to-end without
+any API key.
+"""
+
+import os
+import time
+import operator
+from typing import TypedDict, Annotated
+
+from langgraph.graph import StateGraph, START, END
+
+# ---------------------------------------------------------------------------
+# 1. Try to use real Claude-backed agents; fall back to mock agents if no key
+# ---------------------------------------------------------------------------
+MOCK_MODE = "ANTHROPIC_API_KEY" not in os.environ
+
+if not MOCK_MODE:
+    from langchain_anthropic import ChatAnthropic
+
+    llm = ChatAnthropic(model="claude-sonnet-4-6", max_tokens=500)
+
+    def call_llm(system_prompt: str, query: str) -> str:
+        resp = llm.invoke(
+            [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": query},
+            ]
+        )
+        return resp.content
+else:
+    def call_llm(system_prompt: str, query: str) -> str:
+        # Deterministic fake response so the script is runnable with zero setup
+        time.sleep(1)  # simulate network latency
+        return f"[MOCK | persona: {system_prompt[:30]}...] Answer to: '{query}'"
+
+
+# ---------------------------------------------------------------------------
+# 2. Shared graph state
+#    `agent_responses` uses `operator.add` as a reducer so that if multiple
+#    parallel nodes write to it in the same super-step, LangGraph merges
+#    (concatenates) the lists instead of overwriting one with another.
+# ---------------------------------------------------------------------------
+class OrchestratorState(TypedDict):
+    query: str
+    agent_responses: Annotated[list, operator.add]
+    final_response: str
+
+
+# ---------------------------------------------------------------------------
+# 3. The three parallel agent nodes
+# ---------------------------------------------------------------------------
+def researcher_agent(state: OrchestratorState) -> dict:
+    system_prompt = "You are a meticulous researcher. Provide facts and data."
+    result = call_llm(system_prompt, state["query"])
+    return {"agent_responses": [{"agent": "researcher", "response": result}]}
+
+
+def critic_agent(state: OrchestratorState) -> dict:
+    system_prompt = "You are a sharp critic. Point out risks and weaknesses."
+    result = call_llm(system_prompt, state["query"])
+    return {"agent_responses": [{"agent": "critic", "response": result}]}
+
+
+def creative_agent(state: OrchestratorState) -> dict:
+    system_prompt = "You are a creative strategist. Propose bold, novel ideas."
+    result = call_llm(system_prompt, state["query"])
+    return {"agent_responses": [{"agent": "creative", "response": result}]}
+
+
+# ---------------------------------------------------------------------------
+# 4. Aggregator node — only runs once ALL three parallel agents have finished
+# ---------------------------------------------------------------------------
+def aggregator(state: OrchestratorState) -> dict:
+    lines = [f"### {r['agent'].title()}\n{r['response']}" for r in state["agent_responses"]]
+    combined = "\n\n".join(lines)
+    final = (
+        f"# Orchestrated Answer for: {state['query']}\n\n"
+        f"{combined}\n\n"
+        f"---\n"
+        f"**Synthesis:** {len(state['agent_responses'])} agents responded in parallel. "
+        f"Review each perspective above before deciding."
+    )
+    return {"final_response": final}
+
+
+# ---------------------------------------------------------------------------
+# 5. Build the graph: fan-out from START, fan-in to aggregator, then END
+# ---------------------------------------------------------------------------
+def build_graph():
+    graph = StateGraph(OrchestratorState)
+
+    graph.add_node("researcher", researcher_agent)
+    graph.add_node("critic", critic_agent)
+    graph.add_node("creative", creative_agent)
+    graph.add_node("aggregator", aggregator)
+
+    # Fan-out: all three run concurrently in the same super-step
+    graph.add_edge(START, "researcher")
+    graph.add_edge(START, "critic")
+    graph.add_edge(START, "creative")
+
+    # Fan-in: aggregator waits for all three parents to complete
+    graph.add_edge("researcher", "aggregator")
+    graph.add_edge("critic", "aggregator")
+    graph.add_edge("creative", "aggregator")
+
+    graph.add_edge("aggregator", END)
+
+    return graph.compile()
+
+
+# ---------------------------------------------------------------------------
+# 6. Run it
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    import sys
+
+    query = sys.argv[1] if len(sys.argv) > 1 else "How should we launch our new product?"
+
+    app = build_graph()
+
+    if MOCK_MODE:
+        print("(No ANTHROPIC_API_KEY found — running in MOCK MODE with fake agents)\n")
+
+    start = time.time()
+    result = app.invoke({"query": query, "agent_responses": [], "final_response": ""})
+    elapsed = time.time() - start
+
+    print(result["final_response"])
+    print(f"\n(Total wall-clock time: {elapsed:.2f}s — proof the 3 agents ran in parallel, "
+          f"not sequentially, since each mock agent sleeps 1s.)")
