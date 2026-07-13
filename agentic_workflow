@@ -1,0 +1,519 @@
+"""
+Agentic Workflow — LangGraph implementation of Figure 6
+"End-to-end sequence across layers with Agent 2C explicit"
+
+Layers mirrored from the diagram:
+  UI Layer -> Orchestrator -> Agent 1 (Research) -> Agent 2A (Modeler)
+           -> Agent 2B (Analyst) -> Agent 2C (Reconciliation)
+           -> Agent 3 (Rec SME) -> Agent 4 (Reviewer) -> PostgreSQL (audit)
+
+Stages:
+  1. Configure project -> Orchestrator initializes orchestration_state
+  2. PARALLEL EXECUTION: Agent 1 (market_intelligence draft),
+     Agent 2A (documented_process_model draft),
+     Agent 2B (observed_process_model draft)
+  3. Validate drafts -> write audit_trail + status_flags to Postgres
+  4. Present outputs for coaching -> human feedback -> apply iteration limits
+  5. RECONCILIATION: triggered once 2A & 2B are verified -> Agent 2C reads
+     documented + observed models, writes reconciled_process_item
+  6. Validate reconciliation -> audit -> present panel view -> human confirm/rerun
+  7. SYNTHESIS: triggered with verified inputs -> Agent 3 reads
+     market_intelligence + reconciled_process -> writes proposed_interventions
+  8. Validate interventions -> audit -> present for coaching -> reiterate if any
+  9. HITL Type-2 Approval Gate -> Approve / Reject / Rework
+ 10. On approval: status -> Human_Approved; Roadmap assembled -> finalize
+
+Human-in-the-loop points use LangGraph's `interrupt()` so the graph can be
+paused, persisted (via a checkpointer), resumed from an external UI, and
+resumed again with `Command(resume=...)`.
+"""
+
+from __future__ import annotations
+
+import operator
+import uuid
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal, Optional, TypedDict
+
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt, Command
+
+# ---------------------------------------------------------------------------
+# Optional: real Postgres audit sink. Falls back to an in-memory list if no
+# DSN / driver is available, so the graph is runnable without a live DB.
+# ---------------------------------------------------------------------------
+try:
+    import psycopg2
+
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
+POSTGRES_DSN = None  # e.g. "postgresql://user:pass@localhost:5432/orchestrator"
+
+
+def write_audit_row(record: dict[str, Any]) -> None:
+    """Persist one audit_trail row (+ status flag) to PostgreSQL.
+
+    Mirrors the diagram's repeated 'audit_trail + status flags' /
+    'audit_trail' arrows into the PostgreSQL lifeline. Falls back to a no-op
+    print if psycopg2/DSN aren't configured, so the workflow still runs.
+    """
+    if HAS_PSYCOPG2 and POSTGRES_DSN:
+        conn = psycopg2.connect(POSTGRES_DSN)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO audit_trail
+                        (id, run_id, stage, status, payload, created_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        str(uuid.uuid4()),
+                        record["run_id"],
+                        record["stage"],
+                        record["status"],
+                        str(record.get("payload", {})),
+                        datetime.now(timezone.utc),
+                    ),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    else:
+        # No DB configured -> log locally so the workflow remains testable.
+        print(f"[audit_trail] {record['stage']:<28} status={record['status']}")
+
+
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
+class WorkflowState(TypedDict, total=False):
+    run_id: str
+    project_config: dict[str, Any]
+    orchestration_state: dict[str, Any]
+
+    # Parallel-execution drafts (Stage 2)
+    market_intelligence: dict[str, Any]           # Agent 1 output
+    documented_process_model: dict[str, Any]      # Agent 2A output
+    observed_process_model: dict[str, Any]        # Agent 2B output
+    draft_status_flags: dict[str, str]
+
+    # Coaching / iteration control (applies at multiple gates)
+    coaching_feedback: Optional[str]
+    iteration_count: int
+    max_iterations: int
+
+    # Reconciliation (Stage 5-6, Agent 2C)
+    reconciliation_ready: bool
+    reconciled_process_item: dict[str, Any]
+    reconciliation_confirmed: bool
+
+    # Synthesis (Stage 7-8, Agent 3)
+    proposed_interventions: dict[str, Any]
+    interventions_verified: bool
+
+    # HITL Type-2 approval gate (Stage 9)
+    approval_decision: Optional[Literal["approve", "reject", "rework"]]
+
+    # Final assembly (Stage 10)
+    status: str
+    roadmap: dict[str, Any]
+
+    # Append-only audit log kept in state as well as written to Postgres
+    audit_trail: Annotated[list[dict[str, Any]], operator.add]
+
+
+def _audit(state: WorkflowState, stage: str, status: str, payload: Any = None) -> dict:
+    """Build one audit record, write it to Postgres, and return the delta
+    to merge into state['audit_trail']."""
+    record = {
+        "run_id": state["run_id"],
+        "stage": stage,
+        "status": status,
+        "payload": payload or {},
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    write_audit_row(record)
+    return {"audit_trail": [record]}
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator: configure + initialize (Stage 1)
+# ---------------------------------------------------------------------------
+def configure_project(state: WorkflowState) -> dict:
+    """UI Layer -> Orchestrator: 'Configure project'."""
+    return {
+        "run_id": state.get("run_id") or str(uuid.uuid4()),
+        "iteration_count": 0,
+        "max_iterations": state.get("max_iterations", 3),
+    }
+
+
+def init_orchestration_state(state: WorkflowState) -> dict:
+    """Orchestrator -> PostgreSQL: 'Initialize orchestration_state'."""
+    orchestration_state = {
+        "phase": "parallel_execution",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+    delta = _audit(state, "init_orchestration_state", "initialized", orchestration_state)
+    delta["orchestration_state"] = orchestration_state
+    return delta
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Parallel execution — Agent 1, Agent 2A, Agent 2B
+# (Each is a separate graph node so LangGraph fans them out concurrently
+# and joins automatically at validate_drafts, matching the diagram's
+# 'Parallel Execution' band.)
+# ---------------------------------------------------------------------------
+def agent1_research(state: WorkflowState) -> dict:
+    """Orchestrator -[Trigger]-> Agent 1 Research -> market_intelligence (Draft)."""
+    result = {"summary": "market intelligence draft", "sources": []}
+    delta = _audit(state, "agent1_research", "draft_written", result)
+    delta["market_intelligence"] = result
+    return delta
+
+
+def agent2a_modeler(state: WorkflowState) -> dict:
+    """Orchestrator -[Trigger]-> Agent 2A Modeler -> documented_process_model (Draft)."""
+    result = {"model_type": "documented", "nodes": []}
+    delta = _audit(state, "agent2a_modeler", "draft_written", result)
+    delta["documented_process_model"] = result
+    return delta
+
+
+def agent2b_analyst(state: WorkflowState) -> dict:
+    """Orchestrator -[Trigger]-> Agent 2B Analyst -> observed_process_model (Draft)."""
+    result = {"model_type": "observed", "nodes": []}
+    delta = _audit(state, "agent2b_analyst", "draft_written", result)
+    delta["observed_process_model"] = result
+    return delta
+
+
+def validate_drafts(state: WorkflowState) -> dict:
+    """PostgreSQL -> Orchestrator: 'Validate drafts', then
+    Orchestrator -> PostgreSQL: 'audit_trail + status flags'."""
+    flags = {
+        "market_intelligence": "verified" if state.get("market_intelligence") else "missing",
+        "documented_process_model": "verified" if state.get("documented_process_model") else "missing",
+        "observed_process_model": "verified" if state.get("observed_process_model") else "missing",
+    }
+    delta = _audit(state, "validate_drafts", "validated", flags)
+    delta["draft_status_flags"] = flags
+    return delta
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Present for coaching (HITL) + iteration control
+# ---------------------------------------------------------------------------
+def present_for_coaching(state: WorkflowState) -> dict:
+    """Orchestrator -> UI Layer: 'Present outputs for coaching'; waits for
+    'Coaching feedback (if any)' from the human reviewer."""
+    feedback = interrupt(
+        {
+            "stage": "coaching_drafts",
+            "message": "Review draft outputs and provide feedback (or approve).",
+            "market_intelligence": state.get("market_intelligence"),
+            "documented_process_model": state.get("documented_process_model"),
+            "observed_process_model": state.get("observed_process_model"),
+        }
+    )
+    return {"coaching_feedback": feedback.get("feedback")}
+
+
+def apply_iteration_limits(state: WorkflowState) -> dict:
+    """Orchestrator note: 'Apply iteration limits'."""
+    bump = 1 if state.get("coaching_feedback") else 0
+    return {"iteration_count": state.get("iteration_count", 0) + bump}
+
+
+def route_after_coaching(state: WorkflowState) -> str:
+    if state.get("coaching_feedback") and state["iteration_count"] < state["max_iterations"]:
+        return "agent1_research"  # loop back into parallel execution
+    return "reconciliation_gate"
+
+
+# ---------------------------------------------------------------------------
+# Stage 5-6: Reconciliation — Agent 2C
+# ---------------------------------------------------------------------------
+def reconciliation_gate(state: WorkflowState) -> dict:
+    """Orchestrator: 'Trigger (2A and 2B verified)' — the explicit gate
+    condition called out for Agent 2C in this diagram variant."""
+    flags = state.get("draft_status_flags", {})
+    ready = flags.get("documented_process_model") == "verified" and flags.get(
+        "observed_process_model"
+    ) == "verified"
+    return {"reconciliation_ready": ready}
+
+
+def agent2c_reconciliation(state: WorkflowState) -> dict:
+    """Agent 2C: reads documented_process_model + observed_process_model,
+    writes reconciled_process_item."""
+    reconciled = {
+        "from_documented": state.get("documented_process_model"),
+        "from_observed": state.get("observed_process_model"),
+        "diffs_resolved": True,
+    }
+    delta = _audit(state, "agent2c_reconciliation", "reconciled_written", reconciled)
+    delta["reconciled_process_item"] = reconciled
+    return delta
+
+
+def validate_reconciliation(state: WorkflowState) -> dict:
+    """PostgreSQL -> Orchestrator: 'Validate reconciliation' -> audit_trail."""
+    return _audit(state, "validate_reconciliation", "validated")
+
+
+def present_reconciliation_panel(state: WorkflowState) -> dict:
+    """Orchestrator -> UI Layer: 'Present reconciliation & panel view';
+    waits for 'Confirm or request re-run'."""
+    decision = interrupt(
+        {
+            "stage": "reconciliation_review",
+            "message": "Confirm the reconciled process item, or request a re-run.",
+            "reconciled_process_item": state.get("reconciled_process_item"),
+        }
+    )
+    return {"reconciliation_confirmed": decision.get("action") == "confirm"}
+
+
+def route_after_reconciliation_panel(state: WorkflowState) -> str:
+    if state.get("reconciliation_confirmed"):
+        return "synthesis_gate"
+    return "agent2c_reconciliation"  # request re-run
+
+
+# ---------------------------------------------------------------------------
+# Stage 7-8: Synthesis — Agent 3 Rec SME
+# ---------------------------------------------------------------------------
+def synthesis_gate(state: WorkflowState) -> dict:
+    """Orchestrator: 'Trigger with verified inputs'."""
+    return {"orchestration_state": {**state.get("orchestration_state", {}), "phase": "synthesis"}}
+
+
+def agent3_synthesis(state: WorkflowState) -> dict:
+    """Agent 3 Rec SME: reads market_intelligence + reconciled_process_item,
+    writes proposed_interventions (Draft)."""
+    interventions = {
+        "based_on_market_intelligence": state.get("market_intelligence"),
+        "based_on_reconciled_process": state.get("reconciled_process_item"),
+        "items": [],
+    }
+    delta = _audit(state, "agent3_synthesis", "draft_written", interventions)
+    delta["proposed_interventions"] = interventions
+    return delta
+
+
+def validate_interventions(state: WorkflowState) -> dict:
+    """PostgreSQL -> Orchestrator: 'Validate interventions' -> audit_trail."""
+    delta = _audit(state, "validate_interventions", "validated")
+    delta["interventions_verified"] = True
+    return delta
+
+
+def present_for_coaching_2(state: WorkflowState) -> dict:
+    """Orchestrator -> UI Layer: 'Present for coaching'; waits for
+    'Reiterate (if any)'."""
+    feedback = interrupt(
+        {
+            "stage": "coaching_interventions",
+            "message": "Review proposed interventions; reiterate or approve.",
+            "proposed_interventions": state.get("proposed_interventions"),
+        }
+    )
+    return {"coaching_feedback": feedback.get("feedback")}
+
+
+def route_after_coaching_2(state: WorkflowState) -> str:
+    if state.get("coaching_feedback") and state["iteration_count"] < state["max_iterations"]:
+        return "agent3_synthesis"
+    return "approval_gate"
+
+
+# ---------------------------------------------------------------------------
+# Stage 9-10: HITL Type-2 Approval Gate -> finalize
+# ---------------------------------------------------------------------------
+def approval_gate(state: WorkflowState) -> dict:
+    """Orchestrator -> UI Layer: 'HITL Type-2 Approval Gate'
+    (Approve / Reject / Rework)."""
+    decision = interrupt(
+        {
+            "stage": "approval_gate",
+            "message": "Approve, reject, or send back for rework.",
+            "proposed_interventions": state.get("proposed_interventions"),
+            "reconciled_process_item": state.get("reconciled_process_item"),
+        }
+    )
+    return {"approval_decision": decision.get("decision")}
+
+
+def route_after_approval(state: WorkflowState) -> str:
+    decision = state.get("approval_decision")
+    if decision == "approve":
+        return "update_status_human_approved"
+    if decision == "rework":
+        return "agent3_synthesis"
+    return "END_REJECTED"
+
+
+def update_status_human_approved(state: WorkflowState) -> dict:
+    """Orchestrator -> PostgreSQL: 'Update status Human_Approved'."""
+    delta = _audit(state, "update_status_human_approved", "Human_Approved")
+    delta["status"] = "Human_Approved"
+    return delta
+
+
+def assemble_roadmap(state: WorkflowState) -> dict:
+    """Orchestrator: 'Approved interventions promoted to Human_Approved;
+    Roadmap assembled.' (Step 13 in the source diagram)."""
+    roadmap = {
+        "interventions": state.get("proposed_interventions"),
+        "reconciled_process_item": state.get("reconciled_process_item"),
+        "status": "Human_Approved",
+        "assembled_at": datetime.now(timezone.utc).isoformat(),
+    }
+    delta = _audit(state, "assemble_roadmap", "roadmap_assembled", roadmap)
+    delta["roadmap"] = roadmap
+    return delta
+
+
+def end_rejected(state: WorkflowState) -> dict:
+    return _audit(state, "approval_gate", "rejected")
+
+
+# ---------------------------------------------------------------------------
+# Graph assembly
+# ---------------------------------------------------------------------------
+def build_graph() -> StateGraph:
+    g = StateGraph(WorkflowState)
+
+    g.add_node("configure_project", configure_project)
+    g.add_node("init_orchestration_state", init_orchestration_state)
+
+    g.add_node("agent1_research", agent1_research)
+    g.add_node("agent2a_modeler", agent2a_modeler)
+    g.add_node("agent2b_analyst", agent2b_analyst)
+    g.add_node("validate_drafts", validate_drafts)
+
+    g.add_node("present_for_coaching", present_for_coaching)
+    g.add_node("apply_iteration_limits", apply_iteration_limits)
+
+    g.add_node("reconciliation_gate", reconciliation_gate)
+    g.add_node("agent2c_reconciliation", agent2c_reconciliation)
+    g.add_node("validate_reconciliation", validate_reconciliation)
+    g.add_node("present_reconciliation_panel", present_reconciliation_panel)
+
+    g.add_node("synthesis_gate", synthesis_gate)
+    g.add_node("agent3_synthesis", agent3_synthesis)
+    g.add_node("validate_interventions", validate_interventions)
+    g.add_node("present_for_coaching_2", present_for_coaching_2)
+
+    g.add_node("approval_gate", approval_gate)
+    g.add_node("update_status_human_approved", update_status_human_approved)
+    g.add_node("assemble_roadmap", assemble_roadmap)
+    g.add_node("end_rejected", end_rejected)
+
+    # Stage 1
+    g.add_edge(START, "configure_project")
+    g.add_edge("configure_project", "init_orchestration_state")
+
+    # Stage 2: fan-out to the three parallel agents, fan-in at validate_drafts
+    g.add_edge("init_orchestration_state", "agent1_research")
+    g.add_edge("init_orchestration_state", "agent2a_modeler")
+    g.add_edge("init_orchestration_state", "agent2b_analyst")
+    g.add_edge("agent1_research", "validate_drafts")
+    g.add_edge("agent2a_modeler", "validate_drafts")
+    g.add_edge("agent2b_analyst", "validate_drafts")
+
+    # Stage 3-4
+    g.add_edge("validate_drafts", "present_for_coaching")
+    g.add_edge("present_for_coaching", "apply_iteration_limits")
+    g.add_conditional_edges(
+        "apply_iteration_limits",
+        route_after_coaching,
+        {"agent1_research": "agent1_research", "reconciliation_gate": "reconciliation_gate"},
+    )
+
+    # Stage 5-6
+    g.add_edge("reconciliation_gate", "agent2c_reconciliation")
+    g.add_edge("agent2c_reconciliation", "validate_reconciliation")
+    g.add_edge("validate_reconciliation", "present_reconciliation_panel")
+    g.add_conditional_edges(
+        "present_reconciliation_panel",
+        route_after_reconciliation_panel,
+        {
+            "synthesis_gate": "synthesis_gate",
+            "agent2c_reconciliation": "agent2c_reconciliation",
+        },
+    )
+
+    # Stage 7-8
+    g.add_edge("synthesis_gate", "agent3_synthesis")
+    g.add_edge("agent3_synthesis", "validate_interventions")
+    g.add_edge("validate_interventions", "present_for_coaching_2")
+    g.add_conditional_edges(
+        "present_for_coaching_2",
+        route_after_coaching_2,
+        {"agent3_synthesis": "agent3_synthesis", "approval_gate": "approval_gate"},
+    )
+
+    # Stage 9-10
+    g.add_conditional_edges(
+        "approval_gate",
+        route_after_approval,
+        {
+            "update_status_human_approved": "update_status_human_approved",
+            "agent3_synthesis": "agent3_synthesis",
+            "END_REJECTED": "end_rejected",
+        },
+    )
+    g.add_edge("update_status_human_approved", "assemble_roadmap")
+    g.add_edge("assemble_roadmap", END)
+    g.add_edge("end_rejected", END)
+
+    return g
+
+
+def compile_app():
+    """Compile with a checkpointer so interrupt()/Command(resume=...) work
+    across separate invocations (needed for every HITL gate)."""
+    checkpointer = MemorySaver()
+    return build_graph().compile(checkpointer=checkpointer)
+
+
+# ---------------------------------------------------------------------------
+# Example driver: shows how a caller resumes past each interrupt.
+# In a real deployment, each `interrupt(...)` payload would be rendered by
+# the UI Layer, and the human's response would come back as Command(resume=...).
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    app = compile_app()
+    thread = {"configurable": {"thread_id": str(uuid.uuid4())}}
+
+    # Kick off the run
+    state = app.invoke({"project_config": {"name": "demo"}}, config=thread)
+
+    # Loop: whenever the graph pauses on an interrupt, resume it with a
+    # canned decision (approve everything, no rework) until it finishes.
+    while "__interrupt__" in state:
+        payload = state["__interrupt__"][0].value
+        stage = payload["stage"]
+        print(f"\n--- HITL pause: {stage} ---")
+        print(payload["message"])
+
+        if stage in ("coaching_drafts", "coaching_interventions"):
+            resume_value = {"feedback": None}  # no feedback -> proceed
+        elif stage == "reconciliation_review":
+            resume_value = {"action": "confirm"}
+        elif stage == "approval_gate":
+            resume_value = {"decision": "approve"}
+        else:
+            resume_value = {}
+
+        state = app.invoke(Command(resume=resume_value), config=thread)
+
+    print("\nFinal status:", state.get("status"))
+    print("Roadmap:", state.get("roadmap"))
