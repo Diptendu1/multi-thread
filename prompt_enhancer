@@ -1,0 +1,66 @@
+from langgraph.graph import StateGraph, END
+
+from langchain_google_genai import ChatGoogleGenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+from typing import Dict, Any, Optional
+from typing_extensions import TypedDict
+from pydantic import BaseModel, Field
+
+# Define the structured output for our prompt enhancer
+class EnhancedPrompt(BaseModel):
+    original_query: str = Field(description="The user's original input query.")
+    enhanced_query: str = Field(description="The highly optimized, context-rich version of the query.")
+    chain_of_thought: str = Field(description="Reasoning behind why the enhancements were added.")
+
+# Define the overall state of the graph
+class AgentState(TypedDict, total=False):
+    user_input: str
+    enhanced_result: EnhancedPrompt
+    final_response: str
+
+# Initialize the Gemini model
+llm = ChatGoogleGenAI(model="gemini-2.5-flash", temperature=0.2)
+
+# Bind the Pydantic schema so the model returns a reliable JSON
+structured_llm = llm.with_structured_output(EnhancedPrompt)
+
+# Define the enhancer prompt template
+enhancer_prompt = ChatPromptTemplate.from_messages([
+    ("system", """You are an expert AI prompt engineer. 
+    Your goal is to take a user's brief, basic query and transform it into a highly detailed, 
+    action-rich prompt that will yield the best possible results from an AI model.
+    
+    Add context, specify output format requirements, define a persona, and remove ambiguity.
+    Return the result in the requested JSON structure."""),
+    ("human", "Original Query: {user_input}")
+])
+
+# Define the enhancement node
+def enhance_prompt_node(state: AgentState):
+    prompt_chain = enhancer_prompt | structured_llm
+    result = prompt_chain.invoke({"user_input": state["user_input"]})
+    return {"enhanced_result": result}
+
+# Define the execution node (using the enhanced prompt)
+def execute_task_node(state: AgentState):
+    enhanced_query = state["enhanced_result"].enhanced_query
+    
+    # You can pass the enhanced query to Gemini or another tool
+    response = llm.invoke(enhanced_query)
+    return {"final_response": response.content}
+
+# Initialize the StateGraph
+workflow = StateGraph(AgentState)
+
+# Add nodes
+workflow.add_node("enhancer", enhance_prompt_node)
+workflow.add_node("executor", execute_task_node)
+
+# Set entry point and edges
+workflow.set_entry_point("enhancer")
+workflow.add_edge("enhancer", "executor")
+workflow.add_edge("executor", END)
+
+# Compile the graph
+graph = workflow.compile()
