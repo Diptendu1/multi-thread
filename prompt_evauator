@@ -1,0 +1,275 @@
+"""
+Prompt Evaluator
+----------------
+Evaluates a prompt against several criteria and rates it 1-5 overall.
+
+Criteria:
+  1. Clarity       - Is the prompt easy to understand? Free of vagueness?
+  2. Specificity   - Does it include concrete details, constraints, examples?
+  3. Context       - Does it provide background / role / audience info?
+  4. Structure     - Is it well organized (sections, steps, formatting)?
+  5. Actionability - Does it clearly state the task and expected output?
+
+Each criterion is scored 1-5 using heuristic checks, then combined into a
+weighted overall score. Run the file directly to see a demo, or import
+`PromptEvaluator` in your own code.
+"""
+
+import re
+from dataclasses import dataclass, field
+
+
+# ----------------------------- Data classes ------------------------------ #
+
+@dataclass
+class CriterionResult:
+    name: str
+    score: int                      # 1-5
+    weight: float
+    feedback: list = field(default_factory=list)
+
+
+@dataclass
+class EvaluationReport:
+    prompt: str
+    results: list
+    overall_score: float            # weighted average, 1-5
+
+    def summary(self) -> str:
+        lines = ["=" * 60, "PROMPT EVALUATION REPORT", "=" * 60]
+        preview = self.prompt if len(self.prompt) <= 80 else self.prompt[:77] + "..."
+        lines.append(f'Prompt: "{preview}"')
+        lines.append("-" * 60)
+        for r in self.results:
+            bar = "█" * r.score + "░" * (5 - r.score)
+            lines.append(f"{r.name:<14} {bar}  {r.score}/5  (weight {r.weight:.0%})")
+            for fb in r.feedback:
+                lines.append(f"    • {fb}")
+        lines.append("-" * 60)
+        lines.append(f"OVERALL RATING: {self.overall_score:.1f} / 5  -> {self.verdict()}")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    def verdict(self) -> str:
+        if self.overall_score >= 4.5:
+            return "Excellent"
+        if self.overall_score >= 3.5:
+            return "Good"
+        if self.overall_score >= 2.5:
+            return "Average"
+        if self.overall_score >= 1.5:
+            return "Weak"
+        return "Poor"
+
+
+# ------------------------------ Evaluator -------------------------------- #
+
+class PromptEvaluator:
+    # Adjust weights here (they should sum to 1.0)
+    WEIGHTS = {
+        "Clarity": 0.25,
+        "Specificity": 0.25,
+        "Context": 0.15,
+        "Structure": 0.15,
+        "Actionability": 0.20,
+    }
+
+    VAGUE_WORDS = {
+        "something", "stuff", "things", "somehow", "whatever", "etc",
+        "good", "nice", "better", "maybe", "kind of", "sort of",
+    }
+    ACTION_VERBS = {
+        "write", "create", "generate", "list", "summarize", "explain",
+        "analyze", "compare", "translate", "classify", "extract",
+        "design", "build", "draft", "review", "evaluate", "describe",
+        "convert", "rewrite", "outline", "implement", "code", "make",
+    }
+    CONTEXT_MARKERS = {
+        "you are", "act as", "as a", "for a", "audience", "background",
+        "context", "given that", "i am", "we are", "my", "our",
+    }
+    OUTPUT_MARKERS = {
+        "format", "output", "return", "respond", "in json", "in markdown",
+        "bullet", "table", "word", "words", "paragraph", "sentence",
+        "steps", "list of", "tone", "style", "length",
+    }
+
+    # ------------------------- public interface ------------------------- #
+
+    def evaluate(self, prompt: str) -> EvaluationReport:
+        prompt = prompt.strip()
+        results = [
+            self._score_clarity(prompt),
+            self._score_specificity(prompt),
+            self._score_context(prompt),
+            self._score_structure(prompt),
+            self._score_actionability(prompt),
+        ]
+        overall = sum(r.score * r.weight for r in results)
+        return EvaluationReport(prompt=prompt, results=results, overall_score=round(overall, 2))
+
+    # ------------------------- helper utilities ------------------------- #
+
+    @staticmethod
+    def _words(text: str):
+        return re.findall(r"[a-zA-Z']+", text.lower())
+
+    @staticmethod
+    def _clamp(score: float) -> int:
+        return max(1, min(5, round(score)))
+
+    # ------------------------- criterion scorers ------------------------ #
+
+    def _score_clarity(self, prompt: str) -> CriterionResult:
+        feedback = []
+        words = self._words(prompt)
+        score = 5.0
+
+        if not words:
+            return CriterionResult("Clarity", 1, self.WEIGHTS["Clarity"], ["Prompt is empty."])
+
+        vague_found = [w for w in words if w in self.VAGUE_WORDS]
+        if vague_found:
+            score -= min(2, 0.5 * len(vague_found))
+            feedback.append(f"Vague wording detected: {', '.join(sorted(set(vague_found)))}")
+
+        # Extremely short prompts tend to be ambiguous
+        if len(words) < 5:
+            score -= 2
+            feedback.append("Very short prompt; likely ambiguous.")
+        elif len(words) < 10:
+            score -= 1
+            feedback.append("Short prompt; consider adding detail.")
+
+        # Run-on prompt: very long sentences hurt readability
+        sentences = [s for s in re.split(r"[.!?\n]+", prompt) if s.strip()]
+        avg_len = len(words) / max(1, len(sentences))
+        if avg_len > 40:
+            score -= 1
+            feedback.append("Sentences are very long; break them up for readability.")
+
+        if not feedback:
+            feedback.append("Clear and readable.")
+        return CriterionResult("Clarity", self._clamp(score), self.WEIGHTS["Clarity"], feedback)
+
+    def _score_specificity(self, prompt: str) -> CriterionResult:
+        feedback = []
+        lower = prompt.lower()
+        score = 1.0
+
+        if re.search(r"\d", prompt):
+            score += 1
+            feedback.append("Includes numbers/quantities (good).")
+        if any(m in lower for m in self.OUTPUT_MARKERS):
+            score += 1.5
+            feedback.append("Specifies output format/length/style (good).")
+        if "example" in lower or "e.g." in lower or "for instance" in lower:
+            score += 1
+            feedback.append("Provides examples (good).")
+        if any(k in lower for k in ("must", "should", "do not", "don't", "avoid", "only", "exclude", "include")):
+            score += 1
+            feedback.append("States explicit constraints (good).")
+        if len(self._words(prompt)) >= 25:
+            score += 0.5
+
+        if score <= 2:
+            feedback.append("Add constraints, examples, or an expected output format.")
+        return CriterionResult("Specificity", self._clamp(score), self.WEIGHTS["Specificity"], feedback)
+
+    def _score_context(self, prompt: str) -> CriterionResult:
+        feedback = []
+        lower = prompt.lower()
+        score = 2.0
+
+        hits = [m for m in self.CONTEXT_MARKERS if m in lower]
+        if hits:
+            score += min(3, 1.5 * len(hits))
+            feedback.append("Provides background/role/audience context (good).")
+        else:
+            feedback.append("No context found. Add who/what/why (role, audience, purpose).")
+
+        return CriterionResult("Context", self._clamp(score), self.WEIGHTS["Context"], feedback)
+
+    def _score_structure(self, prompt: str) -> CriterionResult:
+        feedback = []
+        score = 2.5
+        word_count = len(self._words(prompt))
+
+        has_lines = "\n" in prompt.strip()
+        has_bullets = bool(re.search(r"(?m)^\s*([-*•]|\d+[.)])\s", prompt))
+        has_sections = bool(re.search(r"(?m)^\s*[A-Za-z ]{2,30}:\s*$|^#+\s", prompt))
+        has_delimiters = bool(re.search(r'("""|```|<[a-zA-Z_]+>)', prompt))
+
+        if has_bullets:
+            score += 1
+            feedback.append("Uses bullet/numbered lists (good).")
+        if has_sections:
+            score += 1
+            feedback.append("Uses labeled sections/headers (good).")
+        if has_delimiters:
+            score += 1
+            feedback.append("Uses delimiters to separate content (good).")
+        if has_lines and not (has_bullets or has_sections):
+            score += 0.5
+
+        # Short prompts don't need structure; don't punish them.
+        if word_count < 20 and not (has_bullets or has_sections):
+            score = max(score, 3.5)
+            feedback.append("Short prompt; heavy structure not required.")
+        elif word_count >= 60 and not (has_bullets or has_sections or has_lines):
+            score -= 1.5
+            feedback.append("Long prompt with no structure; add sections or bullets.")
+
+        if not feedback:
+            feedback.append("Acceptable structure.")
+        return CriterionResult("Structure", self._clamp(score), self.WEIGHTS["Structure"], feedback)
+
+    def _score_actionability(self, prompt: str) -> CriterionResult:
+        feedback = []
+        words = self._words(prompt)
+        lower = prompt.lower()
+        score = 2.0
+
+        if any(w in self.ACTION_VERBS for w in words[:8]) or any(w in self.ACTION_VERBS for w in words):
+            score += 1.5
+            feedback.append("Contains a clear action verb (good).")
+        else:
+            feedback.append("No clear task verb. Start with e.g. 'Write', 'Summarize', 'Analyze'.")
+
+        if "?" in prompt:
+            score += 0.5  # a question is still a clear ask
+        if any(m in lower for m in self.OUTPUT_MARKERS):
+            score += 1
+            feedback.append("Expected output is described (good).")
+        else:
+            feedback.append("Describe what the output should look like.")
+
+        return CriterionResult("Actionability", self._clamp(score), self.WEIGHTS["Actionability"], feedback)
+
+
+# --------------------------------- Demo ---------------------------------- #
+
+if __name__ == "__main__":
+    evaluator = PromptEvaluator()
+
+    sample_prompts = [
+        "write something about stuff",
+
+        "Summarize this article in 3 bullet points for a general audience.",
+
+        (
+            "You are a senior data analyst. I am preparing a report for our "
+            "marketing team.\n\n"
+            "Task:\n"
+            "- Analyze the attached Q2 sales data\n"
+            "- Identify the top 3 trends\n"
+            "- Suggest 2 actionable recommendations\n\n"
+            "Output format: a markdown report with headers, under 300 words. "
+            "Avoid jargon. For example, explain 'churn' in plain language."
+        ),
+    ]
+
+    for p in sample_prompts:
+        report = evaluator.evaluate(p)
+        print(report.summary())
+        print()
