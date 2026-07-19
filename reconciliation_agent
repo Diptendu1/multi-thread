@@ -1,0 +1,478 @@
+"""
+Agent 2C: Reconciliation Agent
+==============================
+Objective: Merge documented (2A) and observed (2B) models into the
+definitive As-Is Process Twin.
+
+Capabilities (per spec):
+  1. Process Node Matching ... path matching + pgvector similarity on task
+                               descriptions, constrained within abstraction level
+  2. Deviation Analysis ...... Path, Metric, Persona, System, Ghost/Dead
+  3. Severity and Confidence Scoring
+Destination:
+  - `reconciled_process_twin` table
+
+Notes:
+  * When a Postgres + pgvector connection is supplied, description similarity
+    is computed in-database (`embedding <=> embedding`). Otherwise a local
+    TF-IDF cosine similarity fallback is used so the file runs standalone.
+  * Inputs are the outputs of Agent 2A (documented model) and Agent 2B
+    (observed model, e.g. from the `observed_process_model` table).
+
+Dependencies: pandas (required); psycopg2 + pgvector (optional, for Postgres).
+"""
+
+from __future__ import annotations
+
+import difflib
+import json
+import logging
+import math
+import re
+import sqlite3
+from collections import Counter
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("ReconciliationAgent")
+
+
+# ================================================================ input models
+@dataclass
+class ProcessNode:
+    """A single activity/task in either model."""
+    node_id: str
+    name: str
+    description: str = ""
+    abstraction_level: int = 1          # 1 = L1 (high level) ... 3+ = detailed
+    persona: str = ""                   # documented role / observed resource
+    system: str = ""                    # application where the task happens
+    metrics: dict = field(default_factory=dict)   # e.g. {"cycle_time_hours": 4}
+
+
+@dataclass
+class ProcessModel:
+    """Documented (2A) or observed (2B) process model."""
+    model_id: str
+    source: str                         # "documented" | "observed"
+    nodes: list                         # list[ProcessNode]
+    edges: list                         # list[tuple[node_id, node_id]]
+    edge_frequencies: dict = field(default_factory=dict)  # "A -> B": count
+
+
+# ================================================================ output models
+@dataclass
+class NodeMatch:
+    documented_id: str
+    observed_id: str
+    name_similarity: float
+    description_similarity: float
+    combined_score: float
+    method: str                         # "path+pgvector" | "path+tfidf"
+
+
+@dataclass
+class Deviation:
+    deviation_type: str                 # Path | Metric | Persona | System | Ghost | Dead
+    description: str
+    documented_ref: str
+    observed_ref: str
+    severity: str                       # Low | Medium | High | Critical
+    severity_score: float               # 0-1
+    confidence: float                   # 0-1
+    evidence: dict = field(default_factory=dict)
+
+
+@dataclass
+class ReconciledProcessTwin:
+    twin_id: str
+    created_at: str
+    documented_model_id: str
+    observed_model_id: str
+    matches: list
+    deviations: list
+    unified_nodes: list                 # the As-Is twin nodes
+    unified_edges: list
+    summary: dict
+
+
+# ================================================================ similarity
+class SimilarityEngine:
+    """Description similarity: pgvector in Postgres if available, else TF-IDF."""
+
+    def __init__(self, pg_conn=None, embed_fn=None):
+        self.pg_conn = pg_conn          # psycopg2 connection with pgvector
+        self.embed_fn = embed_fn        # callable(text) -> list[float]
+        self.method = "pgvector" if (pg_conn and embed_fn) else "tfidf"
+
+    # ---- public
+    def similarity(self, text_a: str, text_b: str) -> float:
+        if self.method == "pgvector":
+            return self._pgvector_similarity(text_a, text_b)
+        return self._tfidf_cosine(text_a, text_b)
+
+    # ---- pgvector path
+    def _pgvector_similarity(self, a: str, b: str) -> float:
+        va, vb = self.embed_fn(a), self.embed_fn(b)
+        with self.pg_conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 - (%s::vector <=> %s::vector)",   # cosine distance -> similarity
+                (str(va), str(vb)),
+            )
+            return float(cur.fetchone()[0])
+
+    # ---- local fallback
+    @staticmethod
+    def _tokens(text: str) -> Counter:
+        return Counter(re.findall(r"[a-z']+", text.lower()))
+
+    def _tfidf_cosine(self, a: str, b: str) -> float:
+        ta, tb = self._tokens(a), self._tokens(b)
+        if not ta or not tb:
+            return 0.0
+        common = set(ta) & set(tb)
+        dot = sum(ta[w] * tb[w] for w in common)
+        norm = math.sqrt(sum(v * v for v in ta.values())) * \
+               math.sqrt(sum(v * v for v in tb.values()))
+        return dot / norm if norm else 0.0
+
+
+# ================================================================ agent
+class ReconciliationAgent:
+    MATCH_THRESHOLD = 0.55              # combined score needed to accept a match
+    NAME_WEIGHT = 0.45
+    DESC_WEIGHT = 0.55
+
+    def __init__(self, db_path: str = "process_intel.db",
+                 similarity: SimilarityEngine | None = None):
+        self.db_path = db_path
+        self.sim = similarity or SimilarityEngine()
+
+    # ------------------------------------------------ 1. process node matching
+    def match_nodes(self, documented: ProcessModel,
+                    observed: ProcessModel) -> list:
+        """Path matching + description similarity, within abstraction level."""
+        matches, used_observed = [], set()
+
+        for d in documented.nodes:
+            best, best_score = None, 0.0
+            for o in observed.nodes:
+                if o.node_id in used_observed:
+                    continue
+                # Constraint from spec: only compare within abstraction level
+                if o.abstraction_level != d.abstraction_level:
+                    continue
+                name_sim = difflib.SequenceMatcher(
+                    None, d.name.lower(), o.name.lower()).ratio()
+                desc_sim = self.sim.similarity(
+                    d.description or d.name, o.description or o.name)
+                score = self.NAME_WEIGHT * name_sim + self.DESC_WEIGHT * desc_sim
+                if score > best_score:
+                    best, best_score = (o, name_sim, desc_sim), score
+
+            if best and best_score >= self.MATCH_THRESHOLD:
+                o, name_sim, desc_sim = best
+                used_observed.add(o.node_id)
+                matches.append(NodeMatch(
+                    documented_id=d.node_id, observed_id=o.node_id,
+                    name_similarity=round(name_sim, 3),
+                    description_similarity=round(desc_sim, 3),
+                    combined_score=round(best_score, 3),
+                    method=f"path+{self.sim.method}",
+                ))
+        log.info("Matched %d/%d documented nodes", len(matches), len(documented.nodes))
+        return matches
+
+    # ------------------------------------------------ 2. deviation analysis
+    def analyze_deviations(self, documented: ProcessModel, observed: ProcessModel,
+                           matches: list) -> list:
+        devs = []
+        d_by_id = {n.node_id: n for n in documented.nodes}
+        o_by_id = {n.node_id: n for n in observed.nodes}
+        d2o = {m.documented_id: m.observed_id for m in matches}
+        matched_obs = set(d2o.values())
+
+        # ---- Ghost: observed but never documented
+        for o in observed.nodes:
+            if o.node_id not in matched_obs:
+                devs.append(self._score(Deviation(
+                    "Ghost", f"Activity '{o.name}' occurs in reality but is undocumented",
+                    documented_ref="-", observed_ref=o.node_id,
+                    severity="", severity_score=0, confidence=0,
+                    evidence={"system": o.system, "persona": o.persona},
+                )))
+
+        # ---- Dead: documented but never observed
+        for d in documented.nodes:
+            if d.node_id not in d2o:
+                devs.append(self._score(Deviation(
+                    "Dead", f"Documented activity '{d.name}' is never observed",
+                    documented_ref=d.node_id, observed_ref="-",
+                    severity="", severity_score=0, confidence=0,
+                    evidence={},
+                )))
+
+        # ---- Path: edges present in one model but not the other
+        def edge_names(model, id2node):
+            return {
+                f"{id2node[a].name} -> {id2node[b].name}"
+                for a, b in model.edges if a in id2node and b in id2node
+            }
+        d_edges, o_edges = edge_names(documented, d_by_id), edge_names(observed, o_by_id)
+        for e in sorted(o_edges - d_edges):
+            freq = observed.edge_frequencies.get(e, 0)
+            devs.append(self._score(Deviation(
+                "Path", f"Undocumented transition: {e}",
+                documented_ref="-", observed_ref=e,
+                severity="", severity_score=0, confidence=0,
+                evidence={"observed_frequency": freq},
+            )))
+        for e in sorted(d_edges - o_edges):
+            devs.append(self._score(Deviation(
+                "Path", f"Documented transition never taken: {e}",
+                documented_ref=e, observed_ref="-",
+                severity="", severity_score=0, confidence=0,
+                evidence={},
+            )))
+
+        # ---- Metric / Persona / System: compare matched pairs
+        for d_id, o_id in d2o.items():
+            d, o = d_by_id[d_id], o_by_id[o_id]
+
+            for metric, target in d.metrics.items():
+                actual = o.metrics.get(metric)
+                if actual is None or not isinstance(target, (int, float)):
+                    continue
+                if target and actual > target:
+                    ratio = actual / target
+                    devs.append(self._score(Deviation(
+                        "Metric",
+                        f"'{d.name}': {metric} is {actual} vs target {target} "
+                        f"({ratio:.1f}x)",
+                        documented_ref=d_id, observed_ref=o_id,
+                        severity="", severity_score=0, confidence=0,
+                        evidence={"metric": metric, "target": target,
+                                  "actual": actual, "ratio": round(ratio, 2)},
+                    )))
+
+            if d.persona and o.persona and d.persona.lower() != o.persona.lower():
+                devs.append(self._score(Deviation(
+                    "Persona",
+                    f"'{d.name}': documented for '{d.persona}' but performed by "
+                    f"'{o.persona}'",
+                    documented_ref=d_id, observed_ref=o_id,
+                    severity="", severity_score=0, confidence=0,
+                    evidence={"documented": d.persona, "observed": o.persona},
+                )))
+
+            if d.system and o.system and d.system.lower() != o.system.lower():
+                devs.append(self._score(Deviation(
+                    "System",
+                    f"'{d.name}': documented in '{d.system}' but executed in "
+                    f"'{o.system}'",
+                    documented_ref=d_id, observed_ref=o_id,
+                    severity="", severity_score=0, confidence=0,
+                    evidence={"documented": d.system, "observed": o.system},
+                )))
+
+        log.info("Found %d deviations", len(devs))
+        return devs
+
+    # ------------------------------------------------ 3. severity & confidence
+    def _score(self, dev: Deviation) -> Deviation:
+        """Severity: business impact of the deviation. Confidence: evidence strength."""
+        base_severity = {
+            "Ghost": 0.75,      # unknown work = compliance risk
+            "Dead": 0.45,       # stale docs
+            "Path": 0.60,
+            "Metric": 0.55,
+            "Persona": 0.50,
+            "System": 0.65,     # shadow IT risk
+        }[dev.deviation_type]
+
+        score = base_severity
+        conf = 0.6
+
+        ev = dev.evidence
+        if dev.deviation_type == "Path" and "observed_frequency" in ev:
+            freq = ev["observed_frequency"]
+            score += min(0.25, freq / 100)          # frequent deviations matter more
+            conf = min(0.95, 0.5 + freq / 50)       # and are better evidenced
+        if dev.deviation_type == "Metric" and "ratio" in ev:
+            score = min(1.0, 0.3 + 0.15 * ev["ratio"])
+            conf = 0.85                             # measured numbers = high confidence
+        if dev.deviation_type in ("Persona", "System"):
+            conf = 0.8
+        if dev.deviation_type == "Dead":
+            conf = 0.7   # could also be a matching miss
+        if dev.deviation_type == "Ghost":
+            conf = 0.75
+
+        dev.severity_score = round(min(score, 1.0), 3)
+        dev.confidence = round(conf, 3)
+        dev.severity = ("Critical" if dev.severity_score >= 0.85 else
+                        "High" if dev.severity_score >= 0.65 else
+                        "Medium" if dev.severity_score >= 0.45 else "Low")
+        return dev
+
+    # ------------------------------------------------ merge into the twin
+    def build_twin(self, documented: ProcessModel, observed: ProcessModel,
+                   matches: list, deviations: list) -> ReconciledProcessTwin:
+        d_by_id = {n.node_id: n for n in documented.nodes}
+        o_by_id = {n.node_id: n for n in observed.nodes}
+        matched_obs = {m.observed_id for m in matches}
+
+        unified_nodes = []
+        for m in matches:                                # reconciled pairs
+            d, o = d_by_id[m.documented_id], o_by_id[m.observed_id]
+            unified_nodes.append({
+                "twin_node_id": f"T_{m.documented_id}",
+                "name": d.name, "status": "reconciled",
+                "documented_id": d.node_id, "observed_id": o.node_id,
+                "persona": o.persona or d.persona,       # reality wins
+                "system": o.system or d.system,
+                "metrics": {**d.metrics, **o.metrics},
+                "match_confidence": m.combined_score,
+            })
+        for d in documented.nodes:                       # dead nodes kept, flagged
+            if d.node_id not in {m.documented_id for m in matches}:
+                unified_nodes.append({
+                    "twin_node_id": f"T_{d.node_id}", "name": d.name,
+                    "status": "dead", "documented_id": d.node_id,
+                    "observed_id": None, "persona": d.persona,
+                    "system": d.system, "metrics": d.metrics,
+                    "match_confidence": 0.0,
+                })
+        for o in observed.nodes:                         # ghost nodes surfaced
+            if o.node_id not in matched_obs:
+                unified_nodes.append({
+                    "twin_node_id": f"T_{o.node_id}", "name": o.name,
+                    "status": "ghost", "documented_id": None,
+                    "observed_id": o.node_id, "persona": o.persona,
+                    "system": o.system, "metrics": o.metrics,
+                    "match_confidence": 0.0,
+                })
+
+        sev_counts = Counter(d.severity for d in deviations)
+        twin = ReconciledProcessTwin(
+            twin_id=f"twin_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            documented_model_id=documented.model_id,
+            observed_model_id=observed.model_id,
+            matches=[asdict(m) for m in matches],
+            deviations=[asdict(d) for d in deviations],
+            unified_nodes=unified_nodes,
+            unified_edges=sorted(
+                {f"{a}->{b}" for a, b in documented.edges} |
+                set(observed.edge_frequencies.keys())
+            ),
+            summary={
+                "n_matched": len(matches),
+                "n_deviations": len(deviations),
+                "by_type": dict(Counter(d.deviation_type for d in deviations)),
+                "by_severity": dict(sev_counts),
+                "avg_confidence": round(
+                    sum(d.confidence for d in deviations) / len(deviations), 3
+                ) if deviations else 1.0,
+            },
+        )
+        return twin
+
+    # ------------------------------------------------ destination
+    def save_twin(self, twin: ReconciledProcessTwin) -> None:
+        """Destination: reconciled_process_twin table."""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS reconciled_process_twin (
+                    twin_id             TEXT PRIMARY KEY,
+                    created_at          TEXT,
+                    documented_model_id TEXT,
+                    observed_model_id   TEXT,
+                    n_deviations        INTEGER,
+                    twin_json           TEXT
+                )
+            """)
+            conn.execute(
+                "INSERT OR REPLACE INTO reconciled_process_twin VALUES (?,?,?,?,?,?)",
+                (twin.twin_id, twin.created_at, twin.documented_model_id,
+                 twin.observed_model_id, len(twin.deviations),
+                 json.dumps(asdict(twin), default=str)),
+            )
+        log.info("Saved %s to reconciled_process_twin (%s)", twin.twin_id, self.db_path)
+
+    # ------------------------------------------------ orchestrator
+    def run(self, documented: ProcessModel,
+            observed: ProcessModel) -> ReconciledProcessTwin:
+        matches = self.match_nodes(documented, observed)
+        deviations = self.analyze_deviations(documented, observed, matches)
+        twin = self.build_twin(documented, observed, matches, deviations)
+        self.save_twin(twin)
+        return twin
+
+
+# ================================================================ demo
+def _demo_models() -> tuple:
+    documented = ProcessModel(
+        model_id="doc_v3", source="documented",
+        nodes=[
+            ProcessNode("D1", "Receive Order", "Customer order arrives via portal",
+                        1, persona="Sales Rep", system="SAP",
+                        metrics={"cycle_time_hours": 2}),
+            ProcessNode("D2", "Validate Order", "Check stock, credit and pricing",
+                        1, persona="Sales Ops", system="SAP",
+                        metrics={"cycle_time_hours": 4}),
+            ProcessNode("D3", "Manager Approval", "Manager approves orders above limit",
+                        1, persona="Sales Manager", system="SAP"),
+            ProcessNode("D4", "Ship Goods", "Warehouse picks, packs and ships",
+                        1, persona="Warehouse", system="WMS",
+                        metrics={"cycle_time_hours": 24}),
+            ProcessNode("D5", "Close Order", "Invoice and archive the order",
+                        1, persona="Finance", system="SAP"),
+        ],
+        edges=[("D1", "D2"), ("D2", "D3"), ("D3", "D4"), ("D4", "D5")],
+    )
+
+    observed = ProcessModel(
+        model_id="run_20260719_080335", source="observed",
+        nodes=[
+            ProcessNode("O1", "Receive Order", "Order received from customer portal",
+                        1, persona="alice", system="SAP",
+                        metrics={"cycle_time_hours": 2.1}),
+            ProcessNode("O2", "Order Validation", "Stock and credit check for order",
+                        1, persona="bob", system="Excel",          # System deviation!
+                        metrics={"cycle_time_hours": 11}),         # Metric deviation!
+            ProcessNode("O4", "Ship Goods", "Goods picked packed shipped from warehouse",
+                        1, persona="Warehouse", system="WMS",
+                        metrics={"cycle_time_hours": 22}),
+            ProcessNode("O5", "Close Order", "Order invoiced and archived",
+                        1, persona="Finance", system="SAP"),
+            ProcessNode("O9", "WhatsApp Confirmation",                 # Ghost node!
+                        "Rep confirms order details with customer on WhatsApp",
+                        1, persona="alice", system="WhatsApp"),
+        ],
+        edges=[("O1", "O9"), ("O9", "O2"), ("O2", "O4"), ("O4", "O5"),
+               ("O1", "O4")],                                          # skips validation
+        edge_frequencies={
+            "Receive Order -> WhatsApp Confirmation": 41,
+            "WhatsApp Confirmation -> Order Validation": 41,
+            "Order Validation -> Ship Goods": 48,
+            "Ship Goods -> Close Order": 55,
+            "Receive Order -> Ship Goods": 7,
+        },
+    )
+    return documented, observed
+
+
+if __name__ == "__main__":
+    documented, observed = _demo_models()
+    agent = ReconciliationAgent(db_path="process_intel.db")
+    twin = agent.run(documented, observed)
+
+    print(f"\nTwin {twin.twin_id}")
+    print(f"Summary: {json.dumps(twin.summary, indent=2)}")
+    print("\nDeviations (by severity):")
+    for d in sorted(twin.deviations, key=lambda x: -x["severity_score"]):
+        print(f"  [{d['severity']:<8}] {d['deviation_type']:<7} "
+              f"sev={d['severity_score']:.2f} conf={d['confidence']:.2f}  "
+              f"{d['description']}")
